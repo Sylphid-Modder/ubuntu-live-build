@@ -1,0 +1,106 @@
+#!/bin/bash
+
+set -e
+# root detecting.
+if [ "$EUID" != 0 ]; then
+    echo "You're not root. This program requires root privileges."
+    exit
+fi
+
+WORKDIR=$(pwd)
+
+# setup process
+if [ "$1" = "setup" ]; then
+    if [ -z "$2" ]; then
+        echo "ERR: OS name has not been specified. Abort."
+        exit
+    elif [ -z "$3" ]; then
+        echo "ERR: Version information has not been specified. Abort."
+        exit
+    fi
+    
+    OSNAME=$2
+    OSVER=$3
+    
+    echo "INFO: Installing required packages..."
+    apt install -y debootstrap xorriso grub-pc-bin grub-efi-bin
+    
+    echo "INFO: Creating new environment..."
+    if [ -d $WORKDIR/$OSNAME ]; then
+        echo "ERR: Environment exists. Abort."
+        exit
+    fi
+    mkdir $WORKDIR/$OSNAME
+    touch $WORKDIR/$OSNAME/build-info.txt
+    printf "$OSNAME\n$OSVER" >> $WORKDIR/$OSNAME/build-info.txt
+    
+    mkdir $WORKDIR/$OSNAME/image
+    mkdir $WORKDIR/$OSNAME/debootstrap
+    mkdir $WORKDIR/$OSNAME/root
+    mkdir $WORKDIR/$OSNAME/custom-dpkgs
+    touch $WORKDIR/$OSNAME/package-list
+    
+    echo "INFO: Environment $OSNAME is created successfully."
+
+# update process
+elif [ "$1" = "update" ]; then
+    if [ -z "$2" ]; then
+        echo "ERR: Path is not specified. Abort."
+        exit
+    elif [ -z "$3" ]; then
+        echo "ERR: New version is not specified. Abort."
+        exit
+    fi
+    
+    INFODIR=$2
+    INFOFILE=$INFODIR/build-info.txt
+    
+    if [ -f $INFOFILE ]; then
+        echo "INFO: Build information file found."
+    else
+        echo "ERR: Build information file doesn't exist. Abort."
+        exit
+    fi
+    
+    sed -i -e "2c $3" $INFOFILE
+    echo "INFO: Build information has been changed successfully."
+
+elif [ "$1" = "debootstrap" ]; then
+    if [ -z "$2" ]; then
+        echo "ERR: Target path is not specified. Abort."
+        exit
+    elif [ -z "$3" ]; then
+        echo "ERR: Suite is not specified. Abort."
+        exit
+    elif [ -z "$4" ]; then
+        echo "ERR: Mirror server's URL is not specified. Abort."
+        exit
+    fi
+    
+    SUITE=$3
+    TARGETPATH=$WORKDIR/$2/debootstrap
+    URL=$4
+    
+    if [ -d $TARGETPATH ]; then
+        echo "INFO: Target directory has been found."
+    else
+        echo "ERR: Target directory has not been found. Abort."
+        exit
+    fi
+    
+    echo "INFO: Executing debootstrap..."
+    debootstrap --arch=amd64 --variant=minbase $SUITE $TARGETPATH $URL
+    echo "INFO: Process Finished."
+    
+elif [ -z "$1" ] || [ "$1" = "help" ]; then
+    echo "Usage:
+     ./ubuntu-buildscript [option] [arguments]
+      Options:
+         setup [OS-name] [version]: Setup a new environment.
+         update [path] [new-version]: Update revision of specified environment.
+         debootstrap [path] [suite] [URL]: Execute debootstrap to the specified directory.
+         prepare-chroot [path]: Execute preparing process for the specified directory.
+         build: Build debootstrap environment."
+else
+    echo "ERR: Unexpected option."
+fi
