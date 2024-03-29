@@ -23,7 +23,7 @@ if [ "$1" = "setup" ]; then
     OSVER=$3
     
     echo "INFO: Installing required packages..."
-    apt install -y debootstrap xorriso grub-pc-bin grub-efi-bin
+    apt install -y debootstrap casper curl squashfs-tools xorriso grub-pc-bin grub-efi-amd64-bin
     
     echo "INFO: Creating new environment..."
     if [ -d $WORKDIR/$OSNAME ]; then
@@ -55,9 +55,7 @@ elif [ "$1" = "update" ]; then
     INFODIR=$2
     INFOFILE=$INFODIR/build-info.txt
     
-    if [ -f $INFOFILE ]; then
-        echo "INFO: Build information file found."
-    else
+    if [ ! -f $INFOFILE ]; then
         echo "ERR: Build information file doesn't exist. Abort."
         exit
     fi
@@ -77,20 +75,182 @@ elif [ "$1" = "debootstrap" ]; then
         exit
     fi
     
+    BUILDINFO=$WORKDIR/$2/build-info.txt
     SUITE=$3
     TARGETPATH=$WORKDIR/$2/debootstrap
     URL=$4
     
-    if [ -d $TARGETPATH ]; then
-        echo "INFO: Target directory has been found."
-    else
+    if [ ! -d $TARGETPATH ]; then
         echo "ERR: Target directory has not been found. Abort."
         exit
     fi
     
     echo "INFO: Executing debootstrap..."
     debootstrap --arch=amd64 --variant=minbase $SUITE $TARGETPATH $URL
+    
+    echo "INFO: Saving server URL for build..."
+    printf "\n$SUITE\n$URL" >> $BUILDINFO
+    
     echo "INFO: Process Finished."
+    
+elif [ "$1" = "build" ]; then
+    if [ -z "$2" ]; then
+        echo "ERR: Target path is not specified. Abort."
+        exit
+    fi
+    
+    TARGETPATH=$WORKDIR/$2
+    
+    if [ ! -d "$TARGETPATH" ]; then
+        echo "ERR: No such directory. Abort."
+        exit
+    fi
+    
+    if [ ! -f "$TARGETPATH/build-info.txt" ]; then
+        echo "ERR: Build information was not found. Abort."
+        exit
+    elif [ ! -f "$TARGETPATH/package-list" ]; then
+        echo "ERR: Package list was not found. Abort."
+        exit    
+    elif [ ! -d "$TARGETPATH/custom-dpkgs" ]; then
+        echo "ERR: Additional DPKGs folder was not found. Abort."
+        exit
+    elif [ ! -d "$TARGETPATH/root" ]; then
+        echo "ERR: Customized root directory was not found. Abort."
+        exit
+    fi
+    
+    BUILDINFO=$TARGETPATH/build-info.txt
+    PACKAGE_LIST=$TARGETPATH/package-list
+    CUSTOMDPKGFOLDER=$TARGETPATH/custom-dpkgs
+    EDITEDROOT=$TARGETPATH/root
+    DEBOOTSTRAPDIR=$TARGETPATH/debootstrap
+    IMAGEDIR=$TARGETPATH/image
+    
+    echo "INFO: Setting mount points..."
+    mount --bind /dev $DEBOOTSTRAPDIR/dev
+    mount --bind /run $DEBOOTSTRAPDIR/run
+
+    echo "INFO: Setting chroot mount points..."
+chroot $DEBOOTSTRAPDIR <<-EOS 
+mount none -t proc /proc
+mount none -t sysfs /sys
+mount none -t devpts /dev/pts
+export HOME=/root
+EOS
+    
+    echo "INFO: Setting host name..."
+    sed -n -e "1p" $BUILDINFO > $DEBOOTSTRAPDIR/etc/hostname
+    
+    echo "INFO: Setting up apt..."
+    APT_REPOURL=$(sed -n -e "4p" $BUILDINFO)
+    APT_REPOSUITE=$(sed -n -e "3p" $BUILDINFO)
+cat <<- EOS > $DEBOOTSTRAPDIR/etc/apt/sources.list
+deb $APT_REPOURL $APT_REPOSUITE main restricted universe multiverse
+deb-src $APT_REPOURL $APT_REPOSUITE main restricted universe multiverse
+
+deb $APT_REPOURL "$APT_REPOSUITE-security" main restricted universe multiverse
+deb-src $APT_REPOURL "$APT_REPOSUITE-security" main restricted universe multiverse
+
+deb $APT_REPOURL "$APT_REPOSUITE-updates" main restricted universe multiverse
+deb-src $APT_REPOURL "$APT_REPOSUITE-updates" main restricted universe multiverse
+EOS
+
+chroot $DEBOOTSTRAPDIR <<- EOS
+export LC_ALL=C
+apt update
+EOS
+    
+    echo "INFO: Installing important softwares..."
+chroot $DEBOOTSTRAPDIR <<- EOS
+export LC_ALL=C
+apt install -y libterm-readline-gnu-perl systemd-sysv
+dbus-uuidgen > /etc/machine-id
+ln -fs /etc/machine-id /var/lib/dbus/machine-id
+apt upgrade -y
+apt install -y sudo casper laptop-detect os-prober network-manager resolvconf net-tools wireless-tools wpagui locales grub-common grub-gfxpayload-lists grub-pc grub-pc-bin grub2-common nano less curl memtest86+
+apt install -y --no-install-recommends linux-generic
+EOS
+    
+    echo "INFO: Installing specified softwares..."
+    PACKAGES=("")
+    while read i
+    do
+        PACKAGES+=("$i")
+    done < $PACKAGE_LIST
+    
+chroot $DEBOOTSTRAPDIR << EOS
+export LC_ALL=C
+apt install -y ${PACKAGES[@]}
+EOS
+    if [ $(ls $CUSTOMDPKGFOLDER) != "" ]; then
+        echo "INFO: Installing custom dpkgs..."
+        CUSTOMDPKGS=()
+        for i in ls $CUSTOMDPKGFOLDER
+        do
+            CUSTOMDPKGS+=("$CUSTOMDPKGFOLDER/$i")
+        done
+        cp ${CUSTOMDPKGS[@]} $DEBOOTSTRAPFOLDER/tmp/dpkgs
+chroot $DEBOOTSTRAPDIR << EOS
+export LC_ALL=C
+dpkg -i /tmp/dpkgs/*
+EOS
+    fi
+    
+    echo "INFO: Setting up the environment..."
+chroot $DEBOOTSTRAPDIR <<- EOS
+export LC_ALL=C
+locale-gen
+dpkg-reconfigure resolvconf
+cat <<EOF > /etc/NetworkManager/NetworkManager.conf
+[main]
+rc-manager=resolvconf
+plugins=ifupdown,keyfile
+dns=dnsmasq
+
+[ifupdown]
+managed=false
+EOF
+dpkg-reconfigure network-manager
+echo nameserver 1.1.1.1 > /etc/resolv.conf
+EOS
+    
+    echo "INFO: Cleaning up environments..."
+chroot $DEBOOTSTRAPDIR <<- EOS
+truncate -s /etc/machine-id
+rm /sbin/initctl
+dpkg-divert --rename --remove /sbin/initctl
+export LC_ALL=C
+rm -rf /tmp/*
+apt autoremove -y
+apt clean
+umount /proc
+umount /sys
+umount /dev/pts
+rm ~/.bash_history
+EOS
+    umount $DEBOOTSTRAPDIR/dev
+    umount $DEBOOTSTRAPDIR/run
+    
+    echo "INFO: Copying edited root directory..."
+    cp -R $EDITEDROOT/ $DEBOOTSTRAPDIR/
+    
+    echo "INFO: Creating ISO environment..."
+    mkdir -p $IMAGEDIR/{casper,isolinux,install}
+    cp $DEBOOTSTRAPDIR/boot/vmlinuz-**-**-generic $IMAGEDIR/casper/vmlinuz
+    cp $DEBOOTSTRAPDIR/boot/initrd.img-**-**-generic $IMAGEDIR/casper/initrd
+    cp $DEBOOTSTRAPDIR/boot/memtest86+.bin $IMAGEDIR/install/memtest86+
+    
+    echo "INFO: Downloading Memtest86+ for EFI..."
+    curl -o $IMAGEDIR/install/tmp-memtest86.zip https://www.memtest86.com/downloads/memtest86-usb.zip
+    unzip -p $IMAGEDIR/install/tmp-memtest86.zip memtest86-usb.img > $IMAGEDIR/install/memtest86
+    rm -f $IMAGEDIR/install/tmp-memtest86.zip
+    
+    echo "INFO: Constructing GRUB menus..."
+    #Unwritten.
+    
+    echo "INFO: Build process has been finished."
+
     
 elif [ -z "$1" ] || [ "$1" = "help" ]; then
     echo "Usage:
@@ -99,8 +259,7 @@ elif [ -z "$1" ] || [ "$1" = "help" ]; then
          setup [OS-name] [version]: Setup a new environment.
          update [path] [new-version]: Update revision of specified environment.
          debootstrap [path] [suite] [URL]: Execute debootstrap to the specified directory.
-         prepare-chroot [path]: Execute preparing process for the specified directory.
-         build: Build debootstrap environment."
+         build [path]: Build debootstrap environment."
 else
     echo "ERR: Unexpected option."
 fi
