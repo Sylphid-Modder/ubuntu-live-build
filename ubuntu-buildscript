@@ -23,7 +23,7 @@ if [ "$1" = "setup" ]; then
     OSVER=$3
     
     echo "INFO: Installing required packages..."
-    apt install -y debootstrap casper curl squashfs-tools xorriso grub-pc-bin grub-efi-amd64-bin
+    apt install -y binutils debootstrap casper curl squashfs-tools xorriso grub-pc-bin grub-efi-amd64-bin mtools
     
     echo "INFO: Creating new environment..."
     if [ -d $WORKDIR/$OSNAME ]; then
@@ -52,7 +52,7 @@ elif [ "$1" = "update" ]; then
         exit
     fi
     
-    INFODIR=$2
+    INFODIR=$WORKDIR/$2
     INFOFILE=$INFODIR/build-info.txt
     
     if [ ! -f $INFOFILE ]; then
@@ -126,6 +126,19 @@ elif [ "$1" = "build" ]; then
     EDITEDROOT=$TARGETPATH/root
     DEBOOTSTRAPDIR=$TARGETPATH/debootstrap
     IMAGEDIR=$TARGETPATH/image
+    OSNAME=$(sed -n -e '1p' $BUILDINFO)
+    OSBUILDVER=$(sed -n -e '2p' $BUILDINFO)
+    
+    echo "Starting build: 
+    OSNAME: $OSNAME
+    OSBUILDVER: $OSBUILDVER
+    
+    "
+    
+    if [ -f "$IMAGEDIR/casper/filesystem.squashfs" ] || [ -f "$IMAGEDIR/casper/filesystem.size" ] ; then
+        rm -f $IMAGEDIR/casper/filesystem.squashfs
+        rm -f $IMAGEDIR/casper/filesystem.size
+    fi
     
     echo "INFO: Setting mount points..."
     mount --bind /dev $DEBOOTSTRAPDIR/dev
@@ -243,11 +256,102 @@ EOS
     
     echo "INFO: Downloading Memtest86+ for EFI..."
     curl -o $IMAGEDIR/install/tmp-memtest86.zip https://www.memtest86.com/downloads/memtest86-usb.zip
-    unzip -p $IMAGEDIR/install/tmp-memtest86.zip memtest86-usb.img > $IMAGEDIR/install/memtest86
+    unzip -p $IMAGEDIR/install/tmp-memtest86.zip memtest86-usb.img > $IMAGEDIR/install/memtest86-efi
     rm -f $IMAGEDIR/install/tmp-memtest86.zip
     
     echo "INFO: Constructing GRUB menus..."
-    #Unwritten.
+    touch $IMAGEDIR/$OSNAME
+cat <<EOS > $IMAGEDIR/isolinux/grub.cfg
+search --set=root --file /$OSNAME
+
+set default=0
+set timeout=5
+insmod all_video
+
+menuentry "$OSNAME $OSVER Live Boot" {
+	echo "Loading linux..."
+	linux /casper/vmlinuz boot=casper nopersistent toram quiet splash ---
+	echo "Loading initial ram disk..."
+	initrd /casper/initrd
+}
+
+menuentry "$OSNAME $OSVER Installation"{
+	echo "Loading linux..."
+	linux /casper/vmlinuz boot=casper only-ubiquity quiet splash ---
+	echo "Loading initial ram disk..."
+	initrd /casper/initrd
+}
+
+if [ ${grub_platform} == "efi" ]; then
+	menuentry "Memtest86+ (UEFI)"{
+		linux /instal/memtest86-efi keyboard=both
+	}
+	
+	menuentry "UEFI Firmware Settings" --id "uefi-firmware"{
+		fwsetup
+	}
+fi
+	
+if [ ${grub_platform} == "pc" ]; then
+	menuentry "Memtest86+ (BIOS)"{
+		linux16 /install/memtest86+
+	}
+fi
+
+menuentry "Reboot"{
+	echo "System rebooting..."
+	reboot
+}
+
+menuentry "Shutdown"{
+	echo "System shutting now..."
+	halt
+}
+
+
+EOS
+    
+    echo "INFO: Creating filesystem.manifest..."
+    chroot $DEBOOTSTRAPDIR dpkg-query -W --showformat="${Package} ${Version}\n" | tee $IMAGEDIR/casper/filesystem.manifest
+    
+    sudo sed -i "/ubiquity/d" $IMAGEDIR/casper/filesystem.manifest-desktop
+    sudo sed -i "/casper/d" $IMAGEDIR/casper/filesystem.manifest-desktop
+    sudo sed -i "/discover/d" $IMAGEDIR/casper/filesystem.manifest-desktop
+    sudo sed -i "/laptop-detect/d" $IMAGEDIR/casper/filesystem.manifest-desktop
+    sudo sed -i "/os-prober/d" $IMAGEDIR/casper/filesystem.manifest-desktop
+    
+    echo "INFO: Creating squashfs..."
+    mksquashfs $DEBOOTSTRAPDIR $IMAGEDIR/casper/filesystem.squashfs
+    printf $(sudo du -sx --block-size=1 $DEBOOTSTRAPDIR | cut -f1) > $IMAGEDIR/casper/filesystem.size
+    
+    echo "INFO: Creating diskdefines..."
+echo "#define DISKNAME ${OSNAME} ${OSBUILDVER}
+#define TYPE binary
+#define TYPEbinary 1
+#define ARCH amd64
+#define DISKNUM 1
+#define DISKNUM1 1
+#define TOTALNUM 0
+#define TOTALNUM0 1" > $IMAGEDIR/README.diskdefines
+    
+    echo "INFO: Configuring GRUB2 EFI..."
+    grub-mkstandalone --format=x86_64-efi --output=$IMAGEDIR/isolinux/bootx64.efi --locales="" --fonts="" "boot/grub/grub.cfg=$IMAGEDIR/isolinux/grub.cfg"
+    
+    echo "INFO: Creating UEFI boot image..."
+    dd if=/dev/zero of=$IMAGEDIR/isolinux/efiboot.img bs=1M count=10
+    mkfs.vfat $IMAGEDIR/isolinux/efiboot.img
+    LC_CTYPE=C mmd -i $IMAGEDIR/isolinux/efiboot.img efi efi/boot
+    LC_CTYPE=C mcopy -i $IMAGEDIR/isolinux/efiboot.img $IMAGEDIR/isolinux/bootx64.efi ::efi/boot
+    
+    echo "INFO: Configuring GRUB2 PC..."
+    grub-mkstandalone --format=i386-pc --output=$IMAGEDIR/isolinux/grub.img --install-modules="linux16 linux normal iso9660 biosdisk memdisk search tar ls" --modules="linux16 linux normal iso9660 biosdisk search" --locales="" --fonts="" "boot/grub/grub.cfg=$IMAGEDIR/isolinux/grub.cfg"
+    cat /usr/lib/grub/i386-pc/cdboot.img $IMAGEDIR/isolinux/grub.img > $IMAGEDIR/isolinux/bios.img 
+    
+    echo "INFO: Calculating checksums..."
+    sudo /bin/bash -c "(find . -type f -print0 | xargs -0 md5sum | grep -v -e 'md5sum.txt' -e 'bios.img' -e 'efiboot.img' > md5sum.txt)"
+    
+    echo "INFO: Generating ISO..."
+    xorriso -as mkisofs -iso-level 3 -full-iso9660-filenames -volid "$OSNAME $OSBUILDVER Install" -output "$IMAGEDIR/$OSNAME-$OSBUILDVER-amd64-live.iso" -eltorito-boot boot/grub/bios.img -no-emul-boot -boot-load-size 4 -boot-info-table --eltorito-catalog boot/grub/boot.cat --grub2-boot-info --grub2-mbr /usr/lib/grub/i386-pc/boot_hybrid.img -eltorito-alt-boot -e EFI/efiboot.img -no-emul-boot -append_partition 2 0xef $IMAGEDIR/isolinux/efiboot.img -m "$IMAGEDIR/isolinux/efiboot.img" -m "$IMAGEDIR/isolinux/bios.img" -graft-points "/EFI/efiboot.img=$IMAGEDIR/isolinux/efiboot.img" "/boot/grub/bios.img=$IMAGEDIR/isolinux/bios.img" "$IMAGEDIR"
     
     echo "INFO: Build process has been finished."
 
