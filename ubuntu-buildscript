@@ -1,7 +1,7 @@
 #!/bin/bash
 
 set -e
-# root detecting.
+# root detection
 if [ "$EUID" != 0 ]; then
     echo "You're not root. This program requires root privileges."
     exit
@@ -132,7 +132,10 @@ elif [ "$1" = "build" ]; then
     echo "Starting build: 
     OSNAME: $OSNAME
     OSBUILDVER: $OSBUILDVER
-    
+    CUSTOMDPKGFOLDER: $CUSTOMDPKGFOLDER
+    EDITEDROOT: $EDITEDROOT
+    DEBOOTSTRAPDIR: $DEBOOTSTRAPDIR
+    IMAGEDIR: $IMAGEDIR
     "
     
     if [ -f "$IMAGEDIR/casper/filesystem.squashfs" ] || [ -f "$IMAGEDIR/casper/filesystem.size" ] ; then
@@ -146,6 +149,9 @@ elif [ "$1" = "build" ]; then
 
     echo "INFO: Setting chroot mount points..."
 chroot $DEBOOTSTRAPDIR <<-EOS 
+umount /proc
+umount /sys
+umount /dev/pts
 mount none -t proc /proc
 mount none -t sysfs /sys
 mount none -t devpts /dev/pts
@@ -180,6 +186,8 @@ export LC_ALL=C
 apt install -y libterm-readline-gnu-perl systemd-sysv
 dbus-uuidgen > /etc/machine-id
 ln -fs /etc/machine-id /var/lib/dbus/machine-id
+dpkg-divert --local --rename --add /sbin/initctl
+ln -s /bin/true /sbin/initctl
 apt upgrade -y
 apt install -y sudo casper laptop-detect os-prober network-manager resolvconf net-tools wireless-tools wpagui locales grub-common grub-gfxpayload-lists grub-pc grub-pc-bin grub2-common nano less curl memtest86+
 apt install -y --no-install-recommends linux-generic
@@ -196,18 +204,18 @@ chroot $DEBOOTSTRAPDIR << EOS
 export LC_ALL=C
 apt install -y ${PACKAGES[@]}
 EOS
-    if [ $(ls $CUSTOMDPKGFOLDER) != "" ]; then
+    if [ "$(ls $CUSTOMDPKGFOLDER)" != "" ]; then
         echo "INFO: Installing custom dpkgs..."
-        CUSTOMDPKGS=()
-        for i in ls $CUSTOMDPKGFOLDER
-        do
-            CUSTOMDPKGS+=("$CUSTOMDPKGFOLDER/$i")
-        done
-        cp ${CUSTOMDPKGS[@]} $DEBOOTSTRAPFOLDER/tmp/dpkgs
+        if [ ! -d $DEBOOTSTRAPDIR/dpkgs ]; then
+        	mkdir $DEBOOTSTRAPDIR/dpkgs
+        fi
+        cp $CUSTOMDPKGFOLDER/*.deb $DEBOOTSTRAPDIR/dpkgs/
+        echo "DEBUG: Copied all files."
 chroot $DEBOOTSTRAPDIR << EOS
 export LC_ALL=C
-dpkg -i /tmp/dpkgs/*
+apt install -y /dpkgs/*.deb
 EOS
+    rm -r $DEBOOTSTRAPDIR/dpkgs/
     fi
     
     echo "INFO: Setting up the environment..."
@@ -230,7 +238,7 @@ EOS
     
     echo "INFO: Cleaning up environments..."
 chroot $DEBOOTSTRAPDIR <<- EOS
-truncate -s /etc/machine-id
+truncate -s 0 /etc/machine-id
 rm /sbin/initctl
 dpkg-divert --rename --remove /sbin/initctl
 export LC_ALL=C
@@ -249,19 +257,20 @@ EOS
     cp -R $EDITEDROOT/ $DEBOOTSTRAPDIR/
     
     echo "INFO: Creating ISO environment..."
-    mkdir -p $IMAGEDIR/{casper,isolinux,install}
-    cp $DEBOOTSTRAPDIR/boot/vmlinuz-**-**-generic $IMAGEDIR/casper/vmlinuz
-    cp $DEBOOTSTRAPDIR/boot/initrd.img-**-**-generic $IMAGEDIR/casper/initrd
+    mkdir -p $IMAGEDIR/{casper,boot,install}
+    cp -L $DEBOOTSTRAPDIR/boot/vmlinuz $IMAGEDIR/casper/vmlinuz
+    cp -L $DEBOOTSTRAPDIR/boot/initrd.img $IMAGEDIR/casper/initrd
     cp $DEBOOTSTRAPDIR/boot/memtest86+.bin $IMAGEDIR/install/memtest86+
     
     echo "INFO: Downloading Memtest86+ for EFI..."
-    curl -o $IMAGEDIR/install/tmp-memtest86.zip https://www.memtest86.com/downloads/memtest86-usb.zip
-    unzip -p $IMAGEDIR/install/tmp-memtest86.zip memtest86-usb.img > $IMAGEDIR/install/memtest86-efi
+    curl -o $IMAGEDIR/install/tmp-memtest86.zip https://www.memtest.org/download/v7.00/mt86plus_7.00.binaries.zip
+    unzip -p $IMAGEDIR/install/tmp-memtest86.zip memtest64.efi > $IMAGEDIR/install/memtest86plus-efi.efi
+    unzip -p $IMAGEDIR/install/tmp-memtest86.zip memtest64.bin > $IMAGEDIR/install/memtest86plus-bios.bin
     rm -f $IMAGEDIR/install/tmp-memtest86.zip
     
     echo "INFO: Constructing GRUB menus..."
     touch $IMAGEDIR/$OSNAME
-cat <<EOS > $IMAGEDIR/isolinux/grub.cfg
+cat <<EOS > $IMAGEDIR/boot/grub.cfg
 search --set=root --file /$OSNAME
 
 set default=0
@@ -282,9 +291,9 @@ menuentry "$OSNAME $OSVER Installation"{
 	initrd /casper/initrd
 }
 
-if [ ${grub_platform} == "efi" ]; then
-	menuentry "Memtest86+ (UEFI)"{
-		linux /instal/memtest86-efi keyboard=both
+if [ \${grub_platform} == "efi" ]; then
+	menuentry "Memtest86+ (UEFI 64Bit)"{
+		chainloader /install/memtest86plus-efi.efi
 	}
 	
 	menuentry "UEFI Firmware Settings" --id "uefi-firmware"{
@@ -292,9 +301,9 @@ if [ ${grub_platform} == "efi" ]; then
 	}
 fi
 	
-if [ ${grub_platform} == "pc" ]; then
-	menuentry "Memtest86+ (BIOS)"{
-		linux16 /install/memtest86+
+if [ \${grub_platform} == "pc" ]; then
+	menuentry "Memtest86+ (BIOS 64Bit)"{
+		linux /install/memtest64plus-bios.bin
 	}
 fi
 
@@ -312,11 +321,11 @@ menuentry "Shutdown"{
 EOS
     
     echo "INFO: Creating filesystem.manifest..."
-    chroot $DEBOOTSTRAPDIR dpkg-query -W --showformat="${Package} ${Version}\n" | tee $IMAGEDIR/casper/filesystem.manifest
+    chroot $DEBOOTSTRAPDIR dpkg-query -W --showformat="\${Package} \${Version}\n" | tee $IMAGEDIR/casper/filesystem.manifest
+    cp $IMAGEDIR/casper/filesystem.manifest $IMAGEDIR/casper/filesystem.manifest-desktop
     
     sudo sed -i "/ubiquity/d" $IMAGEDIR/casper/filesystem.manifest-desktop
     sudo sed -i "/casper/d" $IMAGEDIR/casper/filesystem.manifest-desktop
-    sudo sed -i "/discover/d" $IMAGEDIR/casper/filesystem.manifest-desktop
     sudo sed -i "/laptop-detect/d" $IMAGEDIR/casper/filesystem.manifest-desktop
     sudo sed -i "/os-prober/d" $IMAGEDIR/casper/filesystem.manifest-desktop
     
@@ -335,23 +344,23 @@ echo "#define DISKNAME ${OSNAME} ${OSBUILDVER}
 #define TOTALNUM0 1" > $IMAGEDIR/README.diskdefines
     
     echo "INFO: Configuring GRUB2 EFI..."
-    grub-mkstandalone --format=x86_64-efi --output=$IMAGEDIR/isolinux/bootx64.efi --locales="" --fonts="" "boot/grub/grub.cfg=$IMAGEDIR/isolinux/grub.cfg"
+    grub-mkstandalone --format=x86_64-efi --output=$IMAGEDIR/boot/bootx64.efi --locales="" --fonts="" "boot/grub/grub.cfg=$IMAGEDIR/boot/grub.cfg"
     
     echo "INFO: Creating UEFI boot image..."
-    dd if=/dev/zero of=$IMAGEDIR/isolinux/efiboot.img bs=1M count=10
-    mkfs.vfat $IMAGEDIR/isolinux/efiboot.img
-    LC_CTYPE=C mmd -i $IMAGEDIR/isolinux/efiboot.img efi efi/boot
-    LC_CTYPE=C mcopy -i $IMAGEDIR/isolinux/efiboot.img $IMAGEDIR/isolinux/bootx64.efi ::efi/boot
+    dd if=/dev/zero of=$IMAGEDIR/boot/efiboot.img bs=1M count=10
+    mkfs.vfat $IMAGEDIR/boot/efiboot.img
+    LC_CTYPE=C mmd -i $IMAGEDIR/boot/efiboot.img efi efi/boot
+    LC_CTYPE=C mcopy -i $IMAGEDIR/boot/efiboot.img $IMAGEDIR/boot/bootx64.efi ::efi/boot
     
     echo "INFO: Configuring GRUB2 PC..."
-    grub-mkstandalone --format=i386-pc --output=$IMAGEDIR/isolinux/grub.img --install-modules="linux16 linux normal iso9660 biosdisk memdisk search tar ls" --modules="linux16 linux normal iso9660 biosdisk search" --locales="" --fonts="" "boot/grub/grub.cfg=$IMAGEDIR/isolinux/grub.cfg"
-    cat /usr/lib/grub/i386-pc/cdboot.img $IMAGEDIR/isolinux/grub.img > $IMAGEDIR/isolinux/bios.img 
+    grub-mkstandalone --format=i386-pc --output=$IMAGEDIR/boot/grub.img --install-modules="linux16 linux normal iso9660 biosdisk memdisk search tar ls halt reboot" --modules="linux16 linux normal iso9660 biosdisk search reboot halt" --locales="" --fonts="" "boot/grub/grub.cfg=$IMAGEDIR/boot/grub.cfg"
+    cat /usr/lib/grub/i386-pc/cdboot.img $IMAGEDIR/boot/grub.img > $IMAGEDIR/boot/bios.img 
     
     echo "INFO: Calculating checksums..."
     sudo /bin/bash -c "(find . -type f -print0 | xargs -0 md5sum | grep -v -e 'md5sum.txt' -e 'bios.img' -e 'efiboot.img' > md5sum.txt)"
     
     echo "INFO: Generating ISO..."
-    xorriso -as mkisofs -iso-level 3 -full-iso9660-filenames -volid "$OSNAME $OSBUILDVER Install" -output "$IMAGEDIR/$OSNAME-$OSBUILDVER-amd64-live.iso" -eltorito-boot boot/grub/bios.img -no-emul-boot -boot-load-size 4 -boot-info-table --eltorito-catalog boot/grub/boot.cat --grub2-boot-info --grub2-mbr /usr/lib/grub/i386-pc/boot_hybrid.img -eltorito-alt-boot -e EFI/efiboot.img -no-emul-boot -append_partition 2 0xef $IMAGEDIR/isolinux/efiboot.img -m "$IMAGEDIR/isolinux/efiboot.img" -m "$IMAGEDIR/isolinux/bios.img" -graft-points "/EFI/efiboot.img=$IMAGEDIR/isolinux/efiboot.img" "/boot/grub/bios.img=$IMAGEDIR/isolinux/bios.img" "$IMAGEDIR"
+    xorriso -as mkisofs -iso-level 3 -full-iso9660-filenames -volid "$OSNAME $OSBUILDVER Install" -output "$OSNAME-$OSBUILDVER-amd64-live.iso" -eltorito-boot boot/grub/bios.img -no-emul-boot -boot-load-size 4 -boot-info-table --eltorito-catalog boot/grub/boot.cat --grub2-boot-info --grub2-mbr /usr/lib/grub/i386-pc/boot_hybrid.img -eltorito-alt-boot -e EFI/efiboot.img -no-emul-boot -append_partition 2 0xef $IMAGEDIR/boot/efiboot.img -m "$IMAGEDIR/boot/efiboot.img" -m "$IMAGEDIR/boot/bios.img" -graft-points "/EFI/efiboot.img=$IMAGEDIR/boot/efiboot.img" "/boot/grub/bios.img=$IMAGEDIR/boot/bios.img" "$IMAGEDIR"
     
     echo "INFO: Build process has been finished."
 
