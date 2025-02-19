@@ -1,7 +1,119 @@
 #!/bin/bash
 
+function attach-devices () {
+    echo "INFO: Setting chroot mount points..."
+
+chroot $1 <<-EOS 
+umount /proc
+umount /sys
+umount /dev/pts
+mount none -t proc /proc
+mount none -t sysfs /sys
+mount none -t devpts /dev/pts
+export HOME=/root
+EOS
+
+}
+
+function setup-apt () {
+    echo "INFO: Setting mount points..."
+    # Bind devices to originals. DO NOT DELETE ENVIRONMENT WITHOUT UNMOUNT.
+    mount --bind /dev $1/dev
+    mount --bind /run $1/run
+
+    attach-devices $1
+    
+    echo "INFO: Setting host name..."
+    sed -n -e "1p" $2 > $1/etc/hostname
+
+    echo "INFO: Setting up apt..."
+    APT_REPOURL=$(sed -n -e "4p" $2)
+    APT_REPOSUITE=$(sed -n -e "3p" $2)
+cat <<- EOS > $DEBOOTSTRAPDIR/etc/apt/sources.list
+deb $APT_REPOURL $APT_REPOSUITE main restricted universe multiverse
+deb-src $APT_REPOURL $APT_REPOSUITE main restricted universe multiverse
+
+deb $APT_REPOURL "$APT_REPOSUITE-security" main restricted universe multiverse
+deb-src $APT_REPOURL "$APT_REPOSUITE-security" main restricted universe multiverse
+
+deb $APT_REPOURL "$APT_REPOSUITE-updates" main restricted universe multiverse
+deb-src $APT_REPOURL "$APT_REPOSUITE-updates" main restricted universe multiverse
+EOS
+
+    chroot $DEBOOTSTRAPDIR <<- EOS
+export LC_ALL=C
+apt update
+EOS
+
+}
+
+function setup-machine () {
+    chroot $1 <<- EOS
+export LC_ALL=C
+apt install -y libterm-readline-gnu-perl systemd-sysv
+dbus-uuidgen > /etc/machine-id
+ln -fs /etc/machine-id /var/lib/dbus/machine-id
+dpkg-divert --local --rename --add /sbin/initctl
+ln -s /bin/true /sbin/initctl
+
+apt upgrade -y
+apt install -y sudo casper laptop-detect os-prober network-manager wireless-tools locales grub-common grub-gfxpayload-lists grub-pc grub-efi-amd64-bin grub2-common nano less curl memtest86+
+apt install -y --no-install-recommends linux-generic
+EOS
+}
+
+function install-packages () {
+    PACKAGE_LIST=$1/../package-list
+        echo "INFO: Installing specified softwares..."
+    CUSTOMDPKGFOLDER=$1/../custom-dpkgs
+    PACKAGES=("")
+    while read i
+    do
+        PACKAGES+=("$i")
+    done < $PACKAGE_LIST
+    
+chroot $1 << EOS
+export LC_ALL=C
+apt install -y ${PACKAGES[@]}
+EOS
+    if [ "$(ls $CUSTOMDPKGFOLDER)" != "" ]; then
+        echo "INFO: Installing custom dpkgs..."
+        if [ ! -d $1/dpkgs ]; then
+        	mkdir $1/dpkgs
+        fi
+        cp $CUSTOMDPKGFOLDER/*.deb $1/dpkgs/
+        echo "DEBUG: Copied all files."
+chroot $1 << EOS
+export LC_ALL=C
+apt install -y /dpkgs/*.deb
+EOS
+    rm -r $1/dpkgs/
+    fi
+    
+}
+
+function cleanup () {
+        echo "INFO: Cleaning up environments..."
+chroot $1 <<- EOS
+truncate -s 0 /etc/machine-id
+rm /sbin/initctl
+dpkg-divert --rename --remove /sbin/initctl
+export LC_ALL=C
+rm -rf /tmp/*
+apt autoremove -y
+apt clean
+umount /proc
+umount /sys
+umount /dev/pts
+rm ~/.bash_history
+
+EOS
+    umount $1/dev
+    umount $1/run
+}
+
 set -e
-# root detection
+# Detect root.
 if [ "$EUID" != 0 ]; then
     echo "You're not root. This program requires root privileges."
     exit
@@ -9,7 +121,7 @@ fi
 
 WORKDIR=$(pwd)
 
-# setup process
+# Environment setup.
 if [ "$1" = "setup" ]; then
     if [ -z "$2" ]; then
         echo "ERR: OS name has not been specified. Abort."
@@ -39,19 +151,19 @@ if [ "$1" = "setup" ]; then
     mkdir $WORKDIR/$OSNAME/root
     mkdir $WORKDIR/$OSNAME/custom-dpkgs
     touch $WORKDIR/$OSNAME/package-list
+    cp /etc/os-release $WORKDIR/$OSNAME/os-release-custom
     
     echo "INFO: Environment $OSNAME is created successfully."
 
-# update process
+# Update version informations
 elif [ "$1" = "update" ]; then
     if [ -z "$2" ]; then
-        echo "ERR: Path is not specified. Abort."
+        echo "ERR: No directory has been specified. Abort."
         exit
     elif [ -z "$3" ]; then
-        echo "ERR: New version is not specified. Abort."
-        exit
+        echo "ERR: Please input the new name of distribution. Abort."
     fi
-    
+
     INFODIR=$WORKDIR/$2
     INFOFILE=$INFODIR/build-info.txt
     
@@ -63,6 +175,27 @@ elif [ "$1" = "update" ]; then
     sed -i -e "2c $3" $INFOFILE
     echo "INFO: Build information has been changed successfully."
 
+# Update the distro name.
+elif [ "$1" = "change-name" ]; then
+    if [ -z "$2" ]; then
+        echo "ERR: No directory has been specified. Abort."
+        exit
+    elif [ -z "$3" ]; then
+        echo "ERR: Please input the new name of distribution. Abort."
+    fi
+
+    INFODIR=$WORKDIR/$2
+    INFOFILE=$INFODIR/build-info.txt
+
+    if [ ! -f $INFOFILE ]; then
+        echo "ERR: Build information file doesn't exist. Abort."
+        exit
+    fi
+
+    sed -i -e "1c $3" $INFOFILE
+    echo "INFO: Build information has been changed successfully."
+
+# Execute debootstrap with given settings.
 elif [ "$1" = "debootstrap" ]; then
     if [ -z "$2" ]; then
         echo "ERR: Target path is not specified. Abort."
@@ -89,10 +222,33 @@ elif [ "$1" = "debootstrap" ]; then
     debootstrap --arch=amd64 --variant=minbase $SUITE $TARGETPATH $URL
     
     echo "INFO: Saving server URL for build..."
-    printf "\n$SUITE\n$URL" >> $BUILDINFO
+    sed -i -e "3c $SUITE" $BUILDINFO
+    sed -i -e "4c $URL" $BUILDINFO
     
     echo "INFO: Process Finished."
+
+# Install specified packages to the debootstrap environment before build process.
+elif [ "$1" = "install-packages" ]; then
+    if [ -z "$2" ]; then
+        echo "ERR: No directory has been specified. Abort."
+        exit
+    elif [ ! -d "$WORKDIR/$2" ]; then
+        echo "ERR: No such directory. Abort."
+        exit
+    elif [ ! -d "$WORKDIR/$2/debootstrap/usr" ]; then
+        echo "ERR: Invalid profile. Abort."
+        exit
+    fi
+
+    DEBOOTSTRAPDIR=$WORKDIR/$2/debootstrap
+    BUILDINFO=$WORKDIR/$2/build-info.txt
     
+    setup-apt $DEBOOTSTRAPDIR $BUILDINFO
+    setup-machine $DEBOOTSTRAPDIR
+    install-packages $DEBOOTSTRAPDIR
+    cleanup $DEBOOTSTRAPDIR
+
+# Build and master process.
 elif [ "$1" = "build" ]; then
     if [ -z "$2" ]; then
         echo "ERR: Target path is not specified. Abort."
@@ -143,119 +299,30 @@ elif [ "$1" = "build" ]; then
         rm -f $IMAGEDIR/casper/filesystem.size
     fi
     
-    echo "INFO: Setting mount points..."
-    mount --bind /dev $DEBOOTSTRAPDIR/dev
-    mount --bind /run $DEBOOTSTRAPDIR/run
-
-    echo "INFO: Setting chroot mount points..."
-chroot $DEBOOTSTRAPDIR <<-EOS 
-umount /proc
-umount /sys
-umount /dev/pts
-mount none -t proc /proc
-mount none -t sysfs /sys
-mount none -t devpts /dev/pts
-export HOME=/root
-EOS
-    
-    echo "INFO: Setting host name..."
-    sed -n -e "1p" $BUILDINFO > $DEBOOTSTRAPDIR/etc/hostname
-    
-    echo "INFO: Setting up apt..."
-    APT_REPOURL=$(sed -n -e "4p" $BUILDINFO)
-    APT_REPOSUITE=$(sed -n -e "3p" $BUILDINFO)
-cat <<- EOS > $DEBOOTSTRAPDIR/etc/apt/sources.list
-deb $APT_REPOURL $APT_REPOSUITE main restricted universe multiverse
-deb-src $APT_REPOURL $APT_REPOSUITE main restricted universe multiverse
-
-deb $APT_REPOURL "$APT_REPOSUITE-security" main restricted universe multiverse
-deb-src $APT_REPOURL "$APT_REPOSUITE-security" main restricted universe multiverse
-
-deb $APT_REPOURL "$APT_REPOSUITE-updates" main restricted universe multiverse
-deb-src $APT_REPOURL "$APT_REPOSUITE-updates" main restricted universe multiverse
-EOS
-
-chroot $DEBOOTSTRAPDIR <<- EOS
-export LC_ALL=C
-apt update
-EOS
+    setup-apt $DEBOOTSTRAPDIR $BUILDINFO
     
     echo "INFO: Installing important softwares..."
-chroot $DEBOOTSTRAPDIR <<- EOS
-export LC_ALL=C
-apt install -y libterm-readline-gnu-perl systemd-sysv
-dbus-uuidgen > /etc/machine-id
-ln -fs /etc/machine-id /var/lib/dbus/machine-id
-dpkg-divert --local --rename --add /sbin/initctl
-ln -s /bin/true /sbin/initctl
-apt upgrade -y
-apt install -y sudo casper laptop-detect os-prober network-manager resolvconf net-tools wireless-tools wpagui locales grub-common grub-gfxpayload-lists grub-pc grub-pc-bin grub2-common nano less curl memtest86+
-apt install -y --no-install-recommends linux-generic
-EOS
+    setup-machine $DEBOOTSTRAPDIR
     
-    echo "INFO: Installing specified softwares..."
-    PACKAGES=("")
-    while read i
-    do
-        PACKAGES+=("$i")
-    done < $PACKAGE_LIST
-    
-chroot $DEBOOTSTRAPDIR << EOS
-export LC_ALL=C
-apt install -y ${PACKAGES[@]}
-EOS
-    if [ "$(ls $CUSTOMDPKGFOLDER)" != "" ]; then
-        echo "INFO: Installing custom dpkgs..."
-        if [ ! -d $DEBOOTSTRAPDIR/dpkgs ]; then
-        	mkdir $DEBOOTSTRAPDIR/dpkgs
-        fi
-        cp $CUSTOMDPKGFOLDER/*.deb $DEBOOTSTRAPDIR/dpkgs/
-        echo "DEBUG: Copied all files."
-chroot $DEBOOTSTRAPDIR << EOS
-export LC_ALL=C
-apt install -y /dpkgs/*.deb
-EOS
-    rm -r $DEBOOTSTRAPDIR/dpkgs/
-    fi
-    
+    install-packages $DEBOOTSTRAPDIR
+
     echo "INFO: Setting up the environment..."
 chroot $DEBOOTSTRAPDIR <<- EOS
 export LC_ALL=C
 locale-gen
-dpkg-reconfigure resolvconf
-cat <<EOF > /etc/NetworkManager/NetworkManager.conf
-[main]
-rc-manager=resolvconf
-plugins=ifupdown,keyfile
-dns=dnsmasq
-
-[ifupdown]
-managed=false
-EOF
 dpkg-reconfigure network-manager
-echo nameserver 1.1.1.1 > /etc/resolv.conf
+update-initramfs -c -k all
 EOS
     
-    echo "INFO: Cleaning up environments..."
-chroot $DEBOOTSTRAPDIR <<- EOS
-truncate -s 0 /etc/machine-id
-rm /sbin/initctl
-dpkg-divert --rename --remove /sbin/initctl
-export LC_ALL=C
-rm -rf /tmp/*
-apt autoremove -y
-apt clean
-umount /proc
-umount /sys
-umount /dev/pts
-rm ~/.bash_history
-EOS
-    umount $DEBOOTSTRAPDIR/dev
-    umount $DEBOOTSTRAPDIR/run
+    cleanup $DEBOOTSTRAPDIR
+    
+    echo "INFO: Copying os-release..."
+    cp $TARGETPATH/os-release-custom $DEBOOTSTRAPDIR/etc/os-release
     
     echo "INFO: Copying edited root directory..."
     cp -R $EDITEDROOT/ $DEBOOTSTRAPDIR/
     
+     
     echo "INFO: Creating ISO environment..."
     mkdir -p $IMAGEDIR/{casper,boot,install}
     cp -L $DEBOOTSTRAPDIR/boot/vmlinuz $IMAGEDIR/casper/vmlinuz
@@ -353,7 +420,7 @@ echo "#define DISKNAME ${OSNAME} ${OSBUILDVER}
     LC_CTYPE=C mcopy -i $IMAGEDIR/boot/efiboot.img $IMAGEDIR/boot/bootx64.efi ::efi/boot
     
     echo "INFO: Configuring GRUB2 PC..."
-    grub-mkstandalone --format=i386-pc --output=$IMAGEDIR/boot/grub.img --install-modules="linux16 linux normal iso9660 biosdisk memdisk search tar ls halt reboot" --modules="linux16 linux normal iso9660 biosdisk search reboot halt" --locales="" --fonts="" "boot/grub/grub.cfg=$IMAGEDIR/boot/grub.cfg"
+    grub-mkstandalone --format=i386-pc --output=$IMAGEDIR/boot/grub.img --install-modules="linux16 linux normal iso9660 biosdisk memdisk search tar ls halt reboot echo" --modules="linux16 linux normal iso9660 biosdisk search reboot halt echo" --locales="" --fonts="" "boot/grub/grub.cfg=$IMAGEDIR/boot/grub.cfg"
     cat /usr/lib/grub/i386-pc/cdboot.img $IMAGEDIR/boot/grub.img > $IMAGEDIR/boot/bios.img 
     
     echo "INFO: Calculating checksums..."
@@ -362,17 +429,27 @@ echo "#define DISKNAME ${OSNAME} ${OSBUILDVER}
     echo "INFO: Generating ISO..."
     xorriso -as mkisofs -iso-level 3 -full-iso9660-filenames -volid "$OSNAME $OSBUILDVER Install" -output "$OSNAME-$OSBUILDVER-amd64-live.iso" -eltorito-boot boot/grub/bios.img -no-emul-boot -boot-load-size 4 -boot-info-table --eltorito-catalog boot/grub/boot.cat --grub2-boot-info --grub2-mbr /usr/lib/grub/i386-pc/boot_hybrid.img -eltorito-alt-boot -e EFI/efiboot.img -no-emul-boot -append_partition 2 0xef $IMAGEDIR/boot/efiboot.img -m "$IMAGEDIR/boot/efiboot.img" -m "$IMAGEDIR/boot/bios.img" -graft-points "/EFI/efiboot.img=$IMAGEDIR/boot/efiboot.img" "/boot/grub/bios.img=$IMAGEDIR/boot/bios.img" "$IMAGEDIR"
     
+    chmod 766 $WORKDIR/$OSNAME-$OSBUILDVER-amd64-live.iso
+    
     echo "INFO: Build process has been finished."
 
-    
 elif [ -z "$1" ] || [ "$1" = "help" ]; then
     echo "Usage:
      ./ubuntu-buildscript [option] [arguments]
       Options:
+
+      Initialize:
          setup [OS-name] [version]: Setup a new environment.
-         update [path] [new-version]: Update revision of specified environment.
-         debootstrap [path] [suite] [URL]: Execute debootstrap to the specified directory.
-         build [path]: Build debootstrap environment."
+         debootstrap [path] [suite] [URL]: Run debootstrap in the specified directory.
+
+      Maintainance:
+         update [path] [new-version]: Update the revision of specified environment.
+         change-name [path] [new-name]: Update the name of specified environment. This command will change the name of distribution too.
+         install-packages [path]: Install the packages, specified in the profile, or contained in the 'custom-dpkgs' directory of each profile. Requires the environment to have already executed debootstrap.
+      
+      Build:
+         build [path]: Build and master the ISO."
+
 else
     echo "ERR: Unexpected option."
 fi
